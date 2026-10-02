@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "fail_mode": "closed",
+
+  "session": {
+    "max_outstanding": 8,
+    "pending_ttl_seconds": 30,
+    "idle_timeout_seconds": 60,
+    "max_conns_per_source": 4
+  },
+
+  "targets": [
+    {
+      "name": "narrow",
+      "listen": "127.0.0.1:5520",
+      "address": "127.0.0.1:5020",
+      "units": [
+        {
+          "id": 1,
+          "description": "Holding registers 0-19 only, and nothing else.",
+          "deny_device_id": true,
+          "deny_event_counter": true,
+          "rules": [
+            {
+              "fc": [3],
+              "start": 0,
+              "count": 20,
+              "note": "The narrow window the integration test checks the edges of."
+            }
+          ]
+        }
+      ]
+    },
+
+    {
+      "name": "wide",
+      "listen": "127.0.0.1:5521",
+      "address": "127.0.0.1:5020",
+      "units": [
+        {
+          "id": 2,
+          "description": "Same physical device, a different window and a different unit id. Proves the two listeners do not share scope.",
+          "rules": [
+            {
+              "fc": [3],
+              "start": 40,
+              "count": 20,
+              "note": "Deliberately disjoint from the narrow target's window."
+            },
+            {
+              "fc": [4],
+              "start": 0,
+              "count": 8,
+              "note": "Input registers, which the narrow target does not permit at all."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

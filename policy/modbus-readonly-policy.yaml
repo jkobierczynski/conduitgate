@@ -1,0 +1,216 @@
+# Modbus/TCP read-only enforcement — reference classification + example policy
+#
+# Posture: DEFAULT DENY. Anything not explicitly listed below is rejected with
+# Modbus exception 0x01 (ILLEGAL FUNCTION). Unknown, reserved, malformed and
+# vendor-specific function codes all fail closed.
+#
+# Architectural assumption: the proxy PARSES to a typed struct, VALIDATES, then
+# RE-SERIALIZES a canonical PDU. Attacker bytes are never forwarded. This is what
+# eliminates the MBAP length-desync smuggling class, where the filter frames a
+# message as [read][padding] and the PLC frames it as [read][write].
+
+schema: conduitscope.modbus-policy/v1
+default_action: deny
+on_deny:
+  # Return a well-formed protocol error, not a silent drop. A dropped packet
+  # makes the client hang and retransmit; an exception response makes the denial
+  # visible and debuggable to the engineer on the far end.
+  respond: exception
+  exception_code: 0x01   # ILLEGAL FUNCTION
+  log: always
+
+framing:
+  # MBAP: TxID(2) ProtoID(2) Length(2) UnitID(1). Length counts UnitID + PDU.
+  enforce_protocol_id_zero: true      # non-zero ProtoID has been used to tunnel
+  max_pdu_bytes: 253
+  reassembly:
+    # PDUs pipeline on one connection and split across TCP segments. Per-packet
+    # inspection is evaded by putting the function-code byte in its own segment.
+    mode: byte_stream                 # never per-packet
+    per_direction_buffer: true
+    half_open_pdu_timeout_s: 5        # a 7-byte MBAP declaring Length=253 then
+                                      # stalling holds a buffer open indefinitely
+  reject_on:
+    - length_field_mismatch           # MBAP Length disagrees with internal byte count
+    - trailing_bytes_within_length    # the smuggling primitive
+    - truncated_pdu
+    - pdu_exceeds_max
+
+# ---------------------------------------------------------------------------
+# ALLOWED — genuine reads
+# ---------------------------------------------------------------------------
+allow:
+  - fc: 0x01
+    name: Read Coils
+  - fc: 0x02
+    name: Read Discrete Inputs
+  - fc: 0x03
+    name: Read Holding Registers
+  - fc: 0x04
+    name: Read Input Registers
+  - fc: 0x0B
+    name: Get Comm Event Counter
+
+  - fc: 0x2B
+    name: Encapsulated Interface Transport
+    # MUST be gated on the MEI type byte, never on the function code alone.
+    mei_allow: [0x0E]                 # 14 = Read Device Identification, read-only
+    # 0x0D (13) = CANopen General Reference — a full read AND WRITE path into the
+    # object dictionary. A tunnel. Denied by omission.
+    # All other MEI values reserved -> denied.
+    device_id_object_max: 0x06        # 0x80-0xFF is a vendor free-for-all; some
+                                      # devices expose credentials there
+
+  - fc: 0x08
+    name: Diagnostics
+    # Subfunction allowlist is mandatory. Several subfunctions change state.
+    subfunction_allow:
+      - 0x0002  # Return Diagnostic Register
+      - 0x000B  # Return Bus Message Count
+      - 0x000C  # Return Bus Comm Error Count
+      - 0x000D  # Return Bus Exception Error Count
+      - 0x000E  # Return Server Message Count
+      - 0x000F  # Return Server No Response Count
+      - 0x0010  # Return Server NAK Count
+      - 0x0011  # Return Server Busy Count
+      - 0x0012  # Return Bus Character Overrun Count
+    # Deliberately NOT allowed:
+    #   0x0000 Return Query Data       -> loopback amplifier, echoes arbitrary data
+    #   0x0001 Restart Comms Option    -> warm restart of the comms processor
+    #   0x0003 Change ASCII Delimiter  -> persistent config change
+    #   0x0004 Force Listen Only Mode  -> ONE-PACKET DoS, isolates the device,
+    #                                     returns no response
+    #   0x000A Clear Counters          -> anti-forensic
+    #   0x0014 Clear Overrun Counter   -> anti-forensic
+
+# ---------------------------------------------------------------------------
+# DENIED — with reasons. Listed explicitly so the denial is auditable, not
+# incidental. Default-deny already covers these; the enumeration is evidence.
+# ---------------------------------------------------------------------------
+deny:
+  # --- plain writes ---
+  - fc: 0x05  { name: Write Single Coil }
+  - fc: 0x06  { name: Write Single Register }
+  - fc: 0x0F  { name: Write Multiple Coils }
+  - fc: 0x10  { name: Write Multiple Registers }
+  - fc: 0x15  { name: Write File Record }
+  - fc: 0x16
+    name: Mask Write Register
+    reason: >
+      Read-modify-write: Result = (Current AND And_Mask) OR (Or_Mask AND NOT And_Mask).
+      A classifier asking "does this PDU carry a value to store" misses it — the
+      masks do not look like data.
+
+  # --- the hybrid: the single most important deny in this file ---
+  - fc: 0x17
+    name: Read/Write Multiple Registers
+    reason: >
+      One PDU, both operations, and the spec is explicit that THE WRITE IS
+      PERFORMED BEFORE THE READ. The response carries only the read data, so the
+      write is silent. Any filter written as "does this PDU read registers?"
+      passes it and the operator sees a normal read response come back.
+      There is no way to permit the read half. Deny outright.
+
+  # --- reads that are not reads ---
+  - fc: 0x14
+    name: Read File Record
+    reason: >
+      Reads "extended memory". On Modicon-family devices file records back
+      configuration and program storage — this is a program upload, not a tag
+      read. Also a multi-sub-request PDU whose byte-count field can disagree
+      with the actual data length.
+  - fc: 0x18
+    name: Read FIFO Queue
+    reason: Spec says non-destructive; some vendor implementations pop the queue.
+  - fc: 0x07
+    name: Read Exception Status
+    reason: Serial-oriented, information disclosure. Allow only if you need it.
+  - fc: 0x0C
+    name: Get Comm Event Log
+    reason: Information disclosure.
+  - fc: 0x11
+    name: Report Server ID
+    reason: Fingerprinting. Allow only if your HMI genuinely requires it.
+
+  # --- vendor sub-protocols: the trap that defeats rule-based filters ---
+  - fc: 0x5A
+    name: "UMAS (Schneider Electric)"
+    severity: critical
+    reason: >
+      0x5A (90) sits in the spec's RESERVED list, not the user-defined ranges, so
+      a filter that default-denies 65-72 and 100-110 while treating "reserved" as
+      unused passes the entire Modicon engineering protocol.
+      Structure: [0x5A][session key][UMAS FC][data].
+      UMAS 0x21 pu_WriteMemoryBlock  — arbitrary memory write, NO reservation required
+      UMAS 0x40 ex_StartTask         — start PLC,  no reservation absent an app password
+      UMAS 0x41 ex_StopTask          — STOP PLC,   no reservation absent an app password
+      UMAS 0x30/31/32                — program download
+      This is why the posture must be default-deny rather than a ruleset:
+      nobody writes a signature for a function code they have not enumerated.
+
+  - fc_range: [0x41, 0x48]   # 65-72
+    name: User-defined function codes
+    reason: Vendor-assigned, undocumented contents. Siemens, WAGO, Hitachi et al.
+  - fc_range: [0x64, 0x6E]   # 100-110
+    name: User-defined function codes
+    reason: As above.
+  - fc_list: [0x09, 0x0A, 0x0D, 0x0E, 0x29, 0x2A, 0x5B, 0x7D, 0x7E, 0x7F]
+    name: Reserved function codes
+    reason: >
+      9, 10, 13, 14, 41, 42, 91, 125, 126, 127. Reserved does not mean unused —
+      see 0x5A above. Fail closed.
+
+# ---------------------------------------------------------------------------
+# Scoping. Policy is keyed on (dst_ip, dst_port, unit_id) — NOT on IP alone.
+# Behind a TCP/RTU gateway or a ControlLogix/Modicon backplane bridge, the Unit
+# Identifier selects a DIFFERENT PHYSICAL DEVICE at the same IP:port. An
+# IP-keyed policy is meaningless there.
+# ---------------------------------------------------------------------------
+targets:
+  - id: line3-plc-a
+    dst_ip: 10.20.30.11
+    dst_port: 502
+    unit_id: 1
+    inherit: allow                     # the allowlist above
+    address_constraints:
+      # Function code granularity is not enough on its own. Tofino got this right
+      # in 2010: FC + register/coil range + unit ID.
+      - fc: 0x03
+        start: 40001
+        count_max: 125
+      - fc: 0x04
+        start: 30001
+        count_max: 125
+
+  - id: line3-gateway-uid7
+    dst_ip: 10.20.30.11
+    dst_port: 502
+    unit_id: 7                         # same IP, different device behind the gateway
+    inherit: allow
+    address_constraints:
+      - fc: 0x03
+        start: 40100
+        count_max: 20
+
+# ---------------------------------------------------------------------------
+# Session state
+# ---------------------------------------------------------------------------
+session:
+  # TxID is not required to be unique, monotonic or non-zero. A proxy keying its
+  # state table on TxID can be forced into collisions. Rewrite TxIDs and keep a
+  # bidirectional map; handle client reuse.
+  rewrite_transaction_id: true
+  max_outstanding_per_conn: 16
+  max_conns_per_source: 4
+  idle_timeout_s: 120                  # no application-layer keepalive exists;
+                                       # teardown of a stalled backend is heuristic
+
+# ---------------------------------------------------------------------------
+# Availability. IEC 62443-3-3 SR 5.2 RE 3 wants fail-close at a zone boundary;
+# SR 7.1/7.2 push the other way. An inline element in an OT path must state its
+# failure mode explicitly rather than inherit one.
+# ---------------------------------------------------------------------------
+failure_mode: fail_closed              # fail_closed | fail_open — choose deliberately
+health:
+  max_added_latency_ms: 5
+  on_budget_exceeded: log_and_continue

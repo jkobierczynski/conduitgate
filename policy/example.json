@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "fail_mode": "closed",
+
+  "sources": [
+    "10.40.0.0/24"
+  ],
+
+  "session": {
+    "max_outstanding": 16,
+    "pending_ttl_seconds": 30,
+    "idle_timeout_seconds": 120,
+    "max_conns_per_source": 4
+  },
+
+  "targets": [
+    {
+      "name": "line3-plc",
+      "listen": "0.0.0.0:5021",
+      "address": "10.20.30.11:502",
+
+      "units": [
+        {
+          "id": 1,
+          "description": "Line 3 main PLC. Process values only; the recipe block at 500+ is deliberately out of scope.",
+          "rules": [
+            {
+              "fc": [3],
+              "start": 0,
+              "count": 20,
+              "note": "Process values 40001-40020 in HMI numbering. Read by the SCADA historian."
+            },
+            {
+              "fc": [4],
+              "start": 0,
+              "count": 16,
+              "note": "Input registers: analogue sensor block."
+            },
+            {
+              "fc": [1, 2],
+              "start": 0,
+              "count": 64,
+              "note": "Status coils and discrete inputs shown on the vendor's diagnostic page."
+            }
+          ]
+        },
+        {
+          "id": 7,
+          "description": "Flow meter behind the serial gateway, same IP and port as unit 1.",
+          "deny_device_id": true,
+          "deny_event_counter": true,
+          "rules": [
+            {
+              "fc": [3],
+              "start": 100,
+              "count": 20,
+              "note": "Totaliser registers only. Calibration block at 200+ stays unreachable."
+            }
+          ]
+        }
+      ]
+    },
+
+    {
+      "name": "packaging-hmi",
+      "listen": "0.0.0.0:5022",
+      "address": "10.20.31.40:502",
+
+      "sources": [
+        "10.40.0.55/32"
+      ],
+
+      "units": [
+        {
+          "id": 1,
+          "description": "Packaging line HMI gateway. Vendor support access during maintenance windows.",
+          "deny_event_counter": true,
+          "rules": [
+            {
+              "fc": [3],
+              "start": 0,
+              "count": 8,
+              "note": "Machine state and fault code words. Everything else is out of the vendor's scope."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
