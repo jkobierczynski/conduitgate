@@ -74,7 +74,8 @@ Why a denial happened:
     "max_outstanding": 16,
     "pending_ttl_seconds": 30,
     "idle_timeout_seconds": 120,
-    "max_conns_per_source": 4
+    "max_conns_per_source": 4,
+    "half_open_timeout_seconds": 5
   },
 
   "targets": [
@@ -202,6 +203,14 @@ agreeing with you.
 segments and several may coalesce into one. Every per-packet Modbus filter is
 evaded by putting the function-code byte in a segment of its own.
 
+**Bound the half-open frame separately from the idle session.** A client that
+sends a seven-byte header declaring 253 bytes and then stops is not idle — bytes
+arrived, just never enough to decide anything about — so the idle timeout does
+not cover it. It is the Modbus shape of a slowloris, and the answer is a short
+timeout on an incomplete frame, deliberately not a tarpit: an inline element in
+a control path should release resources rather than hold connections open on
+purpose.
+
 **Never resynchronize.** MBAP has no sync pattern or frame delimiter, so after a
 framing error there is no sound way to find the next boundary — the attacker
 chooses where you land. Framing errors are sticky and the connection is torn
@@ -253,7 +262,8 @@ three integration suites, and tears everything down on exit. It refuses to start
 on top of anything and names what is there instead of just reporting a
 collision.
 
-- **`go test ./...`** — 66 tests and three fuzz targets, ~68% of the package.
+- **`go test ./...`** — 79 tests and three fuzz targets, ~90% of the package,
+  clean under `-race`.
 - **`test/enforcement_test.py`** — classification and evasion. Writes 0xDEAD
   directly to the device first, to prove the harness can change state before
   claiming the proxy stopped it, then asserts the register is *unchanged* after
@@ -274,9 +284,6 @@ vague about.
   against simulators, public captures and fuzzing.
 - **Not certified.** 62443-4-2 would assess this as an NDR-class component; that
   work has not been done.
-- **The proxy loop has no unit tests.** Target down, disconnect mid-transaction,
-  slowloris and concurrent clients are exercised only incidentally.
-- **The half-open PDU timeout is declared but not enforced** in the read loop.
 - **No TLS**, so no Modbus/TCP Security (port 802).
 - **No multiplexing**, no connection pooling, no HA, no management plane.
 - **`fail_mode` is a real decision, not a default.** IEC 62443-3-3 SR 5.2 RE 3

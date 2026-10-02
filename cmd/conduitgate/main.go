@@ -53,9 +53,10 @@ func runPolicy(path string) {
 	}
 
 	maxOut, ttl, idle, maxConns := pol.SessionLimits()
-	log.Printf("policy %s: %d target(s), fail %s, %d outstanding, %ds ttl, %ds idle, %d conns/source",
+	log.Printf("policy %s: %d target(s), fail %s, %d outstanding, %ds ttl, %ds idle, "+
+		"%d conns/source, half-open %s",
 		path, len(pol.Targets), failWord(pol.FailOpen()), maxOut,
-		int(ttl.Seconds()), int(idle.Seconds()), maxConns)
+		int(ttl.Seconds()), int(idle.Seconds()), maxConns, halfOpenWord(pol.HalfOpenTimeout()))
 	if pol.FailOpen() {
 		log.Printf("WARNING: fail_mode is \"open\" — denied requests are forwarded, " +
 			"and this proxy enforces nothing")
@@ -120,6 +121,13 @@ func runBench(listen, target string, diag bool) {
 	log.Printf("no policy: global read-only posture, all unit ids and addresses reachable")
 	log.Printf("conduitgate listening on %s -> %s (read-only)", listen, target)
 	log.Fatal(p.Serve(ln))
+}
+
+func halfOpenWord(d time.Duration) string {
+	if d < 0 {
+		return "disabled"
+	}
+	return d.String()
 }
 
 func failWord(open bool) string {

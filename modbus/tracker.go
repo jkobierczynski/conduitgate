@@ -14,6 +14,11 @@ const DefaultMaxOutstanding = 16
 // that never replies would otherwise leak an entry per request.
 const DefaultPendingTTL = 30 * time.Second
 
+// DefaultHalfOpenTimeout bounds how long a client may hold an incomplete frame.
+// Short on purpose: a legitimate client completes a PDU within one round trip,
+// so seconds here are already generous.
+const DefaultHalfOpenTimeout = 5 * time.Second
+
 type pendingReq struct {
 	txid   uint16
 	unitID uint8

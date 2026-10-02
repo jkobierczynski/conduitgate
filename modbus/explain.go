@@ -116,6 +116,19 @@ truncated.`,
 that wraps would serve a different range than the policy checked, so this is a
 policy-integrity refusal rather than a courtesy.`,
 
+	ReasonHalfOpenPDU: `A client sent an MBAP header declaring a PDU and then stopped, holding a
+reassembly buffer open without completing the frame.
+
+This is the Modbus shape of a slowloris: a seven-byte header declaring 253 bytes
+costs the sender nothing and makes the proxy hold state, and enough such peers
+exhaust it. The idle timeout does not cover it, because the connection is not
+idle — bytes did arrive, just never enough to decide anything about.
+
+The defence is a short timeout on an incomplete frame specifically, separate
+from and much shorter than the idle timeout on a quiet but well-behaved session.
+Deliberately not a tarpit: an inline element in a control path should release
+resources rather than hold connections open on purpose.`,
+
 	ReasonTooManyOutstanding: `The connection already holds the configured maximum of in-flight requests.
 Bounding this stops a client making the proxy hold correlation state on its
 behalf. Raise session.max_outstanding if a legitimate client pipelines harder.`,

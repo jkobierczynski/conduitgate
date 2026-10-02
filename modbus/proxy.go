@@ -65,6 +65,15 @@ type Proxy struct {
 	// means unbounded.
 	MaxConnsPerSource int
 
+	// HalfOpenTimeout bounds how long a client may hold an incomplete frame.
+	// Zero means DefaultHalfOpenTimeout; a negative value disables the check.
+	//
+	// This is separate from, and much shorter than, IdleTimeout. A peer that
+	// sends a header declaring 253 bytes and then stops is not idle — bytes
+	// arrived, just never enough to decide anything about — so the idle timeout
+	// does not cover it.
+	HalfOpenTimeout time.Duration
+
 	// Rules is this target's scoping. When nil the proxy applies Limits
 	// globally with no scoping, which is the bench posture, not a deployment
 	// one: every unit id is reachable and every address is in range.
@@ -181,6 +190,13 @@ func (p *Proxy) handle(client net.Conn) error {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+		// Closing the client when the response side ends is what tells a
+		// waiting client that the device is gone. Without it the request
+		// goroutine stays blocked on its read until the idle timeout, so a PLC
+		// dropping the connection looks to the client like a very slow reply
+		// rather than a fault — minutes of silence instead of an immediate
+		// close. Found by TestProxyDeviceDisconnectsMidTransaction.
+		defer client.Close()
 		p.filterResponses(server, remote, tracker, writeClient)
 	}()
 
@@ -197,10 +213,31 @@ func (p *Proxy) filterRequests(client, server net.Conn, remote string,
 	fr := NewFramer()
 	buf := make([]byte, 4096)
 
+	halfOpen := p.HalfOpenTimeout
+	if halfOpen == 0 {
+		halfOpen = DefaultHalfOpenTimeout
+	}
+
+	// partialSince is when the framer first held an incomplete frame, reset
+	// every time the buffer drains.
+	var partialSince time.Time
+
 	for {
+		// The read deadline is the earlier of the idle deadline and the
+		// half-open deadline. Without folding the latter in, a peer holding an
+		// incomplete frame would simply block here until the idle timeout,
+		// which is the whole problem.
+		deadline := time.Time{}
 		if p.IdleTimeout > 0 {
-			_ = client.SetReadDeadline(time.Now().Add(p.IdleTimeout))
+			deadline = time.Now().Add(p.IdleTimeout)
 		}
+		if !partialSince.IsZero() && halfOpen > 0 {
+			if d := partialSince.Add(halfOpen); deadline.IsZero() || d.Before(deadline) {
+				deadline = d
+			}
+		}
+		_ = client.SetReadDeadline(deadline)
+
 		n, err := client.Read(buf)
 		if n > 0 {
 			if ferr := fr.Feed(buf[:n]); ferr != nil {
@@ -223,8 +260,25 @@ func (p *Proxy) filterRequests(client, server net.Conn, remote string,
 					return derr
 				}
 			}
+
+			if fr.Buffered() > 0 {
+				if partialSince.IsZero() {
+					partialSince = time.Now()
+				}
+			} else {
+				partialSince = time.Time{}
+			}
 		}
+
 		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() &&
+				!partialSince.IsZero() && halfOpen > 0 &&
+				time.Since(partialSince) >= halfOpen {
+				p.emit(Event{Dir: DirRequest, Remote: remote, Allowed: false,
+					Reason: ReasonHalfOpenPDU,
+					Detail: fmt.Sprintf("held %d bytes of an incomplete frame for %s without completing it",
+						fr.Buffered(), halfOpen)})
+			}
 			if err == io.EOF {
 				return nil
 			}

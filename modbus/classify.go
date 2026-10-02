@@ -31,6 +31,7 @@ const (
 	ReasonMalformed        = "pdu.malformed"
 	ReasonQuantity         = "pdu.quantity_out_of_range"
 	ReasonAddressOverflow  = "pdu.address_overflow"
+	ReasonHalfOpenPDU      = "pdu.half_open_timeout"
 
 	// Policy-layer reasons. These are refusals by the operator's rule set
 	// rather than by the protocol classification above.

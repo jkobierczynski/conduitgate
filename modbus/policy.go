@@ -58,6 +58,10 @@ type SessionPolicy struct {
 	PendingTTLSeconds  int `json:"pending_ttl_seconds" yaml:"pending_ttl_seconds"`
 	IdleTimeoutSeconds int `json:"idle_timeout_seconds" yaml:"idle_timeout_seconds"`
 	MaxConnsPerSource  int `json:"max_conns_per_source" yaml:"max_conns_per_source"`
+
+	// HalfOpenTimeoutSeconds bounds how long a client may hold an incomplete
+	// frame. Zero takes the default; -1 disables the check.
+	HalfOpenTimeoutSeconds int `json:"half_open_timeout_seconds" yaml:"half_open_timeout_seconds"`
 }
 
 // TargetPolicy is one device, reached through one listener.
@@ -157,6 +161,10 @@ func (p *Policy) compile() error {
 	if p.Session.MaxOutstanding < 0 || p.Session.PendingTTLSeconds < 0 ||
 		p.Session.IdleTimeoutSeconds < 0 || p.Session.MaxConnsPerSource < 0 {
 		return fmt.Errorf("policy: session values must not be negative")
+	}
+	if p.Session.HalfOpenTimeoutSeconds < -1 {
+		return fmt.Errorf("policy: half_open_timeout_seconds must be positive, " +
+			"0 for the default, or -1 to disable")
 	}
 
 	var err error
@@ -307,6 +315,20 @@ func (p *Policy) SessionLimits() (maxOutstanding int, pendingTTL, idle time.Dura
 	return maxOutstanding, pendingTTL, idle, p.Session.MaxConnsPerSource
 }
 
+// HalfOpenTimeout resolves the configured bound on an incomplete frame.
+// Kept separate from SessionLimits rather than making that a five-value return,
+// which was already at the edge of readable.
+func (p *Policy) HalfOpenTimeout() time.Duration {
+	switch n := p.Session.HalfOpenTimeoutSeconds; {
+	case n == 0:
+		return DefaultHalfOpenTimeout
+	case n < 0:
+		return -1 // disabled
+	default:
+		return time.Duration(n) * time.Second
+	}
+}
+
 // Target returns a target by name.
 func (p *Policy) Target(name string) (*TargetPolicy, bool) {
 	for _, t := range p.Targets {
@@ -328,6 +350,7 @@ func (p *Policy) NewProxy(t *TargetPolicy) *Proxy {
 		PendingTTL:        pendingTTL,
 		IdleTimeout:       idle,
 		MaxConnsPerSource: maxConns,
+		HalfOpenTimeout:   p.HalfOpenTimeout(),
 		FailOpen:          p.FailOpen(),
 	}
 }
