@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, so that govulncheck reports against a moving database even when
+    # nothing in the repository has changed.
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: build and test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Tracked rather than pinned. Standard-library advisories are a
+        # property of the toolchain, not of this code, so a pinned version
+        # accumulates them until someone edits this file.
+        go: [oldstable, stable]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          check-latest: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt'd:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: vet
+        run: go vet ./...
+
+      - name: build
+        run: go build -ldflags "-X main.version=${GITHUB_SHA::8}" -o conduitgate ./cmd/conduitgate
+
+      - name: test with the race detector
+        run: go test ./... -race -count=1 -coverprofile=cover.out
+
+      - name: coverage
+        run: go tool cover -func=cover.out | tail -1
+
+      - name: the shipped example policy must load
+        run: ./conduitgate -policy policy/example.json -explain list > /dev/null
+
+      # Invoked through bash rather than directly: the execute bit does not
+      # survive every way this tree gets distributed, and CI should not fail
+      # over a file mode.
+      - name: integration suites
+        run: |
+          python3 -m pip install --quiet pymodbus
+          bash test/run_all.sh
+
+  fuzz:
+    name: fuzz the parsers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+
+      # Short runs on every push, seeded from testdata. These parse hostile
+      # input inline in a control path, so a crash found here is worth more
+      # than the minute it costs.
+      - name: framer
+        run: go test ./modbus -run=XXX -fuzz=FuzzFramer -fuzztime=60s
+      - name: request decoder
+        run: go test ./modbus -run=XXX -fuzz=FuzzRequestRoundTrip -fuzztime=60s
+      - name: response decoder
+        run: go test ./modbus -run=XXX -fuzz=FuzzResponseRoundTrip -fuzztime=60s
+
+      - name: keep any crasher
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus
+          path: modbus/testdata/fuzz/
+
+  vuln:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    # Reported, not gating. Almost everything govulncheck finds here is a
+    # standard-library advisory whose fix is a toolchain release, so blocking
+    # merges on it means a red build every time Go publishes an advisory before
+    # the patch version ships — which teaches people to ignore CI. Read the
+    # output; gate on the tests.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+      - run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      # -scan symbol is the default and already limits results to reachable
+      # symbols, but reachability through io.Writer and similar interfaces is
+      # resolved conservatively: expect traces claiming that fmt.Fprintf
+      # reaches crypto/tls. Check whether the package is genuinely used before
+      # acting on a finding. This binary does no TLS and parses no
+      # certificates.
+      - run: govulncheck ./...

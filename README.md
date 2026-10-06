@@ -254,7 +254,7 @@ protocol, precisely because those CPUs have no protection level worth the name.
 ## Testing
 
 ```sh
-test/run_all.sh --clean
+bash test/run_all.sh --clean
 ```
 
 Builds, brings up five listeners on their proper ports, runs the unit tests and
@@ -262,8 +262,9 @@ three integration suites, and tears everything down on exit. It refuses to start
 on top of anything and names what is there instead of just reporting a
 collision.
 
-- **`go test ./...`** — 79 tests and three fuzz targets, ~90% of the package,
-  clean under `-race`.
+- **`go test ./...`** — 85 tests and three fuzz targets, ~91% of the package,
+  clean under `-race`. CI additionally runs each fuzz target for a minute and
+  `govulncheck`.
 - **`test/enforcement_test.py`** — classification and evasion. Writes 0xDEAD
   directly to the device first, to prove the harness can change state before
   claiming the proxy stopped it, then asserts the register is *unchanged* after
@@ -275,6 +276,77 @@ collision.
 - **`test/identity.py`** — tells you what is actually listening on a port, so a
   misconfigured harness fails with a clear message instead of a confusing one.
 
+Invoked through `bash` above so it works whether or not the execute bit
+survived however you obtained the tree. `chmod +x test/run_all.sh` if you would
+rather run it directly.
+
+## Operating it
+
+**Logging.** `-log-format json` emits one structured record per decision, which
+is what a SIEM wants; `text` is the default for a terminal. Denials are
+warnings and always logged. Permitted operations are off unless you pass
+`-log-allows`, because a polling HMI produces one every poll interval forever —
+logging them by default buries the denials and swamps whatever collects them.
+The field to alert on is `reason`.
+
+```json
+{"time":"...","level":"WARN","msg":"deny","target":"narrow","dir":"request",
+ "remote":"10.40.0.55:51234","txid":1,"unit":1,"fc":"0x5A",
+ "fc_name":"UMAS (Schneider Electric)","reason":"fc.umas",
+ "detail":"Schneider engineering protocol hiding in the reserved range..."}
+```
+
+**Metrics.** `-metrics 127.0.0.1:9502` serves Prometheus text at `/metrics` and
+`/healthz`, on its own listener separate from every data path — bind it to a
+management interface. Label cardinality is bounded by the policy and the fixed
+set of reason codes, so there is nothing per-connection or per-register to
+explode.
+
+```
+conduitgate_requests_total{target="narrow",decision="deny"} 12
+conduitgate_denials_total{target="narrow",direction="request",reason="fc.umas"} 1
+conduitgate_connections_open{target="narrow"} 0
+```
+
+**Reload.** `SIGHUP` (or `systemctl reload`) re-reads the policy and swaps the
+rule sets — units, address windows, per-target source lists — which take effect
+on the next request of every live connection, including ones already open. For
+a security policy that is the right behaviour: a rule an operator has just
+tightened should not wait for a long-lived HMI session to reconnect.
+
+Changes to targets, listen addresses, session bounds or `fail_mode` are
+**refused**, logged with what differs, and the running policy is kept. A policy
+that fails to parse or validate is refused the same way. Rebinding listeners or
+retuning timeouts underneath an inline element in a control path is worse than
+asking for a restart at a moment you choose.
+
+**systemd.** `deploy/conduitgate.service` runs it unprivileged with
+`CAP_NET_BIND_SERVICE` as the only capability, a read-only filesystem, a
+syscall filter, and `AF_INET`/`AF_INET6` as the only address families. Note
+what a restart means: while the process is down the path is down. That is the
+fail-closed behaviour, not an outage to engineer around — if you would rather
+traffic flowed unfiltered than not at all, that belongs in `fail_mode`,
+visibly.
+
+## Building
+
+No dependencies, so `go build ./cmd/conduitgate` is the whole story. Two notes
+that matter for something inline in a control path.
+
+**Use a current toolchain.** Standard-library advisories — TLS, x509, net/http,
+asn1 — are a property of the Go release you build with, not of this code.
+`govulncheck` will report a long list against an old toolchain and almost none
+against a current one. CI tracks `stable` and `oldstable` rather than pinning
+versions, for exactly that reason.
+
+**Reading a govulncheck report.** Reachability through `io.Writer` and similar
+interfaces is resolved conservatively, so you will see traces claiming that
+`fmt.Fprintf` reaches `crypto/tls`, or that a string replacer reaches
+`encoding/asn1`. They are call-graph artifacts. This binary does no TLS, parses
+no certificates and reads no PEM; the only genuine HTTP surface is the metrics
+endpoint, which is off unless `-metrics` is given. Check whether a package is
+actually used before acting on a finding.
+
 ## Limitations
 
 Stated plainly, because an inline element in a control path is not a thing to be
@@ -285,6 +357,9 @@ vague about.
 - **Not certified.** 62443-4-2 would assess this as an NDR-class component; that
   work has not been done.
 - **No TLS**, so no Modbus/TCP Security (port 802).
+- **No authentication of its own.** It enforces by source address, not identity;
+  binding policy to an authenticated session is the obvious next step and is
+  where the unoccupied ground actually is.
 - **No multiplexing**, no connection pooling, no HA, no management plane.
 - **`fail_mode` is a real decision, not a default.** IEC 62443-3-3 SR 5.2 RE 3
   wants fail-close at a zone boundary; SR 7.1/7.2 push the other way. Choose

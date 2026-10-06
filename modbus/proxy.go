@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -74,17 +75,38 @@ type Proxy struct {
 	// does not cover it.
 	HalfOpenTimeout time.Duration
 
-	// Rules is this target's scoping. When nil the proxy applies Limits
-	// globally with no scoping, which is the bench posture, not a deployment
-	// one: every unit id is reachable and every address is in range.
-	Rules *TargetPolicy
+	// Metrics is optional; nil disables counting.
+	Metrics *Metrics
 
 	OnEvent  func(Event)
 	FailOpen bool // never set this without a documented reason
 
+	// rules is this target's scoping, held atomically so that a SIGHUP reload
+	// can swap it without stopping the listener. A nil value applies Limits
+	// globally with no scoping, which is the bench posture, not a deployment
+	// one: every unit id is reachable and every address is in range.
+	//
+	// Swapping takes effect on the next request of every live connection,
+	// including ones already open. For a security policy that is the correct
+	// behaviour — a rule an operator has just tightened should not wait for a
+	// long-lived HMI session to reconnect.
+	rules atomic.Pointer[TargetPolicy]
+
 	mu    sync.Mutex
 	conns map[string]int // live connections per source address
 }
+
+// SetRules installs this target's scoping, replacing any previous rules.
+func (p *Proxy) SetRules(t *TargetPolicy) {
+	if t == nil {
+		p.rules.Store(nil)
+		return
+	}
+	p.rules.Store(t)
+}
+
+// Rules returns the scoping currently in force.
+func (p *Proxy) Rules() *TargetPolicy { return p.rules.Load() }
 
 // Serve accepts connections until the listener is closed.
 //
@@ -100,10 +122,14 @@ func (p *Proxy) Serve(ln net.Listener) error {
 			return err
 		}
 		if !p.admit(c) {
+			p.Metrics.Inc("conduitgate_connections_total", "target", p.Name, "outcome", "refused")
 			c.Close()
 			continue
 		}
+		p.Metrics.Inc("conduitgate_connections_total", "target", p.Name, "outcome", "accepted")
+		p.Metrics.Add("conduitgate_connections_open", 1, "target", p.Name)
 		go func() {
+			defer p.Metrics.Add("conduitgate_connections_open", -1, "target", p.Name)
 			defer p.release(c)
 			defer c.Close()
 			_ = p.handle(c)
@@ -123,7 +149,7 @@ func (p *Proxy) admit(c net.Conn) bool {
 	ip, host := sourceIP(c)
 	remote := c.RemoteAddr().String()
 
-	if p.Rules != nil && (ip == nil || !p.Rules.AllowSource(ip)) {
+	if rules := p.Rules(); rules != nil && (ip == nil || !rules.AllowSource(ip)) {
 		p.emit(Event{Dir: DirRequest, Remote: remote, Allowed: false,
 			Reason: ReasonSourceNotAllowed,
 			Detail: "source address is not listed for this target"})
@@ -297,8 +323,8 @@ func (p *Proxy) decideRequest(frame Frame, remote string, server net.Conn,
 	// a unit the policy does not list is not a device this proxy fronts.
 	lim := p.Limits
 	var unit *UnitPolicy
-	if p.Rules != nil {
-		u, ok := p.Rules.Unit(frame.UnitID)
+	if rules := p.Rules(); rules != nil {
+		u, ok := rules.Unit(frame.UnitID)
 		if !ok {
 			d := deny(fc, ReasonUnitNotAllowed,
 				fmt.Sprintf("unit id %d is not listed for this target", frame.UnitID),
@@ -409,8 +435,8 @@ func (p *Proxy) decideResponse(frame Frame, remote string,
 	}
 
 	lim := p.Limits
-	if p.Rules != nil {
-		if u, ok := p.Rules.Unit(frame.UnitID); ok {
+	if rules := p.Rules(); rules != nil {
+		if u, ok := rules.Unit(frame.UnitID); ok {
 			lim = u.Limits()
 		}
 	}
@@ -458,9 +484,34 @@ func (p *Proxy) emitDenial(dir, remote string, frame Frame, fc byte, d *Denial) 
 	})
 }
 
+// emit is the single point every decision passes through, so it is where
+// metrics are counted as well as where events are reported.
 func (p *Proxy) emit(e Event) {
+	e.Target = p.Name
+
+	decision := "deny"
+	if e.Allowed {
+		decision = "allow"
+	}
+	switch e.Dir {
+	case DirResponse:
+		p.Metrics.Inc("conduitgate_responses_total", "target", p.Name, "decision", decision)
+	default:
+		p.Metrics.Inc("conduitgate_requests_total", "target", p.Name, "decision", decision)
+	}
+	if !e.Allowed && e.Reason != "" {
+		p.Metrics.Inc("conduitgate_denials_total",
+			"target", p.Name, "direction", dirWord(e.Dir), "reason", e.Reason)
+	}
+
 	if p.OnEvent != nil {
-		e.Target = p.Name
 		p.OnEvent(e)
 	}
+}
+
+func dirWord(dir string) string {
+	if dir == DirResponse {
+		return DirResponse
+	}
+	return DirRequest
 }

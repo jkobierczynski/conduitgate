@@ -477,7 +477,7 @@ func TestProxyRefusesUnlistedSource(t *testing.T) {
 	pol := mustPolicy(t, doc)
 	tp, _ := pol.Target("x")
 
-	addr, sink := startProxy(t, dev.addr(), func(p *Proxy) { p.Rules = tp })
+	addr, sink := startProxy(t, dev.addr(), func(p *Proxy) { p.SetRules(tp) })
 
 	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
@@ -500,7 +500,7 @@ func TestProxyRefusesUnlistedSource(t *testing.T) {
 func TestProxyAppliesAddressRules(t *testing.T) {
 	dev := newFakeDevice(t, nil)
 	tp, _ := mustPolicy(t, minimalPolicy).Target("line3")
-	addr, _ := startProxy(t, dev.addr(), func(p *Proxy) { p.Rules = tp })
+	addr, _ := startProxy(t, dev.addr(), func(p *Proxy) { p.SetRules(tp) })
 
 	c := dial(t, addr)
 	send(t, c, 1, 1, readHolding(0, 1))

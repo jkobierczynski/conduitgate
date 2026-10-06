@@ -457,7 +457,7 @@ func TestNewProxyCarriesSettings(t *testing.T) {
 	tp, _ := p.Target("line3")
 	proxy := p.NewProxy(tp)
 
-	if proxy.Name != "line3" || proxy.Target != "127.0.0.1:5020" || proxy.Rules != tp {
+	if proxy.Name != "line3" || proxy.Target != "127.0.0.1:5020" || proxy.Rules() != tp {
 		t.Errorf("proxy not bound to its target: %+v", proxy)
 	}
 	if proxy.MaxOutstanding != 4 || proxy.PendingTTL.Seconds() != 7 ||

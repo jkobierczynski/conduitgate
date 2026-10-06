@@ -342,10 +342,9 @@ func (p *Policy) Target(name string) (*TargetPolicy, bool) {
 // NewProxy builds the enforcement proxy for one target.
 func (p *Policy) NewProxy(t *TargetPolicy) *Proxy {
 	maxOutstanding, pendingTTL, idle, maxConns := p.SessionLimits()
-	return &Proxy{
+	proxy := &Proxy{
 		Name:              t.Name,
 		Target:            t.Address,
-		Rules:             t,
 		MaxOutstanding:    maxOutstanding,
 		PendingTTL:        pendingTTL,
 		IdleTimeout:       idle,
@@ -353,6 +352,8 @@ func (p *Policy) NewProxy(t *TargetPolicy) *Proxy {
 		HalfOpenTimeout:   p.HalfOpenTimeout(),
 		FailOpen:          p.FailOpen(),
 	}
+	proxy.SetRules(t)
+	return proxy
 }
 
 // InheritsSources reports whether this target uses the policy-wide source list

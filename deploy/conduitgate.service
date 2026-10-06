@@ -1,0 +1,83 @@
+# systemd unit for conduitgate.
+#
+# Install:
+#   useradd --system --no-create-home --shell /usr/sbin/nologin conduitgate
+#   install -m 0755 conduitgate /usr/local/bin/conduitgate
+#   install -d -m 0750 -o root -g conduitgate /etc/conduitgate
+#   install -m 0640 -o root -g conduitgate policy.json /etc/conduitgate/policy.json
+#   install -m 0644 deploy/conduitgate.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now conduitgate
+#
+# Reload a policy without dropping connections:
+#   systemctl reload conduitgate
+#
+# That sends SIGHUP, which re-reads the file and swaps the rule sets. Changes to
+# targets, listen addresses or session bounds are refused and logged — those
+# need a restart, at a moment you choose. The policy file is root-owned and
+# group-readable so the service can read it and not rewrite it.
+
+[Unit]
+Description=conduitgate read-only Modbus/TCP enforcement proxy
+Documentation=https://github.com/jkobierczynski/conduitgate
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=conduitgate
+Group=conduitgate
+
+ExecStart=/usr/local/bin/conduitgate \
+    -policy /etc/conduitgate/policy.json \
+    -log-format json \
+    -metrics 127.0.0.1:9502
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Restarting is correct for an enforcement element, but be clear about what it
+# means: while the process is down the path is down. That is the fail-closed
+# behaviour, not an outage to engineer around — if you would rather traffic
+# flowed unfiltered than not at all, that decision belongs in the policy's
+# fail_mode, visibly, and not in a restart policy.
+Restart=on-failure
+RestartSec=2s
+
+# Binding 502 is the only privilege needed, and only when fronting a device on
+# the standard port. Drop everything else.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+
+# Filesystem: nothing to write anywhere.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ReadOnlyPaths=/etc/conduitgate
+UMask=0077
+
+# Kernel and host surface.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete
+
+# TCP only, both families. No unix sockets, no netlink, no raw.
+RestrictAddressFamilies=AF_INET AF_INET6
+
+# Bound the blast radius of a leak in an inline element.
+LimitNOFILE=4096
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target
